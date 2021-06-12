@@ -1,0 +1,144 @@
+---
+title: "sigmorphon 2021 task 0 part evalution and visualization"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(vroom)
+library(ggforce)
+library(ggthemes)
+library(cowplot)
+library(glmmTMB)
+
+source("theme_mikabr.R")
+.font <- "Source Sans Pro"
+theme_set(theme_mikabr(base_family = .font))
+```
+
+```{r}
+dev_files <- list.files("data/dev", full.names = TRUE, pattern = "tsv|txt|csv")
+dev_results <- map_df(dev_files, function(rf) {
+  col_names <- c("lemma", "form", "tag", "rating", "lemma_orth", "form_orth")
+  vroom(rf, col_names = col_names, delim = ) |> mutate(file = rf)
+})
+
+test_files <- list.files("data/test", full.names = TRUE, pattern = "tsv|txt")
+test_results <- map_df(test_files, function(rf) {
+  is_gold <- str_detect(rf, "gold")
+  col_names <- c("lemma", "form",
+                 if (is_gold) c("rating", "tag") else c("tag", "rating"))
+  vroom(rf, col_names = col_names) |> mutate(file = rf)
+})
+
+results_df <- bind_rows(dev_results, test_results) |>
+  mutate(file = basename(file) |> str_remove("\\..*$")) |>
+  separate(file, c("language", "set", "system")) |>
+  select(-tag) |>
+  mutate(across(c(lemma, form), \(s) str_remove_all(s, "[\\s]")),
+         language = fct_recode(language, "Dutch" = "nld", "English" = "eng",
+                               "German" = "deu"))
+
+rating_trans <- function(r) min(1 - 1e-5, max(1e-5, r / 7))
+
+human_data <- results_df |>
+  filter(set == "dev" | system == "gold") |>
+  group_by(set, lemma) |>
+  mutate(option = paste0("option_", 1:n())) |>
+  ungroup() |>
+  mutate(human_rating = map_dbl(rating, rating_trans)) |>
+  select(-system, -rating)
+
+model_data <- results_df |>
+  filter(set == "test", system != "gold") |>
+  rename(model_rating = rating) |>
+  left_join(human_data)
+
+any(is.na(model_data$human_rating))
+any(is.na(model_data$model_rating))
+```
+
+```{r}
+ggplot(human_data, aes(x = option, y = human_rating, colour = option)) +
+  facet_grid(vars(set), vars(language)) +
+  geom_sina(colour = "darkgrey", size = 0.7, alpha = 0.7) +
+  stat_summary(geom = "crossbar", fun.data = mean_cl_boot, width = 0.5) +
+  scale_colour_ptol(guide = FALSE) +
+  labs(x = "", y = "Median human rating")
+ggsave("plots/human_data.png", width = 6, height = 5)
+```
+
+```{r}
+fit_model <- function(df) {
+  glmmTMB(human_rating ~ model_rating + (1 | lemma), data = df,
+          family = beta_family())
+}
+
+models <- model_data |>
+  group_by(language, system) |>
+  nest() |>
+  mutate(model = map(data, fit_model))
+```
+
+```{r}
+model_aic <- models |>
+  mutate(aic = map_dbl(model, AIC)) |>
+  select(language, system, aic) |>
+  ungroup() |>
+  pivot_wider(names_from = language, values_from = aic) |>
+  mutate(Total = German + English + Dutch) |>
+  arrange(Total) %>%
+  mutate(system = fct_inorder(system))
+write_csv(model_aic, "model_aic.csv")
+
+model_aic |>
+  pivot_longer(-system, names_to = "language", values_to = "aic") |>
+  arrange(language, desc(aic)) %>%
+  mutate(order = 1:n()) |>
+  ggplot(aes(x = aic, y = order, colour = system)) +
+  facet_wrap(vars(language), nrow = 1, scales = "free") +
+  coord_cartesian(clip = "off") +
+  geom_rug(sides = "tb", outside = TRUE, length = unit(0.05, "npc")) +
+  geom_text(aes(label = system), family = .font, size = 2.5) +
+  scale_colour_ptol(guide = FALSE) +
+  scale_x_reverse(expand = expansion(mult = 0.15)) +
+  scale_y_discrete(expand = expansion(add = 0.5)) +
+  labs(x = "AIC", y = "") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        strip.text = element_text(margin = margin(t = 2.2, b = 8.8,
+                                                  unit = "pt")))
+ggsave("plots/model_aic.png", width = 7, height = 2.25)
+```
+
+```{r}
+model_fits <- models |>
+  ungroup() |>
+  mutate(fit = map(model, \(m) predict(m, type = "response"))) |>
+  select(-model) |>
+  unnest() %>%
+  mutate(system = factor(system, levels = levels(model_aic$system)))
+
+br <- c(0, 0.5, 1)
+lang_fit_plot <- function(lang) {
+  ggplot(model_fits %>% filter(language == lang),
+         aes(x = human_rating, y = fit, colour = option)) +
+    facet_wrap(vars(system), nrow = 2) +
+    geom_point(size = 0.8) +
+    scale_colour_ptol(guide = FALSE) +
+    scale_x_continuous(limits = c(0, 1), breaks = br,
+                       labels = as.character(br)) +
+    scale_y_continuous(limits = c(0, 1), breaks = br,
+                       labels = as.character(br)) +
+    labs(x = "Human rating", y = "Model fit rating")
+}
+
+plot_grid(lang_fit_plot("German"),
+          lang_fit_plot("English"),
+          lang_fit_plot("Dutch"),
+          labels = c("German", "English", "Dutch"), ncol = 1, align = "left")
+ggsave("plots/model_fits.png", width = 6, height = 10)
+```
